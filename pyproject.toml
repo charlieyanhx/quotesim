@@ -1,0 +1,36 @@
+[project]
+name = "quotesim"
+version = "0.1.0"
+description = "An options quoting simulator with synthetic flow: Avellaneda-Stoikov and Guéant-Lehalle-Fernandez-Tapia quoters in price space and in vol space, delta-band hedging with a cost model, and a P&L attribution whose top identity (spread + inventory + hedge - hedge cost = realised) holds to 1e-9 by construction; paired-seed comparisons only."
+readme = "README.md"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+authors = [{ name = "Hanxiong (Charlie) Yan" }]
+dependencies = ["numpy>=1.26", "scipy>=1.11", "pandas>=2.0"]
+
+[project.optional-dependencies]
+dev = ["pytest>=8", "ruff"]
+
+[project.urls]
+Homepage = "https://github.com/charlieyanhx/quotesim"
+
+[project.scripts]
+quotesim = "quotesim.cli:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/quotesim"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q"
+
+[tool.ruff]
+line-length = 120
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "W", "B"]
+ignore = ["E501"]
