@@ -87,20 +87,75 @@ def test_glft_exact_matches_plan_oracles_at_T600_Q30():
     assert g.offsets(0)[0] + g.offsets(0)[1] == pytest.approx(6.626091, abs=1e-6)
 
 
-def test_glft_eigh_equals_scipy_expm_of_the_generator():
-    """v(t) by symmetric eigendecomposition equals scipy.linalg.expm of the same (shifted) generator to 1e-10
-    relative; the generator has alpha q^2 on the diagonal and -eta off it."""
+def test_glft_uniformization_equals_eigh_and_scipy_expm_of_the_generator():
+    """v(t) by uniformization (default) equals both the symmetric eigendecomposition and scipy.linalg.expm
+    of the same (shifted) generator to 1e-10 relative where those are resolvable (Q = 30: v_30 / v_0 ~ 1e-2);
+    the generator has alpha q^2 on the diagonal and -eta off it."""
     g = GLFT2013(T=600.0, Q=30, **GLFT_EX)
     assert g.alpha == pytest.approx(0.5 * 0.3 * 0.01 * 0.09)
     assert g.eta == pytest.approx(0.9 * (1 + 0.01 / 0.3) ** (-(1 + 0.3 / 0.01)))
     assert g.M[0, 0] == pytest.approx(g.alpha * 900) and g.M[3, 4] == -g.eta and g.M[4, 3] == -g.eta
     for t in (0.0, 123.4, 599.0):
-        v_e, v_x = g.v(t), g.v(t, method="expm")
+        v_u, v_e, v_x = g.v(t), g.v(t, method="eigh"), g.v(t, method="expm")
+        assert np.max(np.abs(v_u / v_x - 1)) < 1e-10
         assert np.max(np.abs(v_e / v_x - 1)) < 1e-10
+    with pytest.raises(ValueError):
+        g.v(0.0, method="pade")
     shift = np.linalg.eigvalsh(g.M).min()
     raw = expm(-g.M * 600.0) @ np.ones(61)
     assert np.allclose(raw / raw[30], g.v(0.0) / g.v(0.0)[30], rtol=1e-9)
     assert np.isfinite(shift)
+
+
+# 70-digit mpmath eigendecomposition of the same tridiagonal (scratchpad mp_ref.py, dps = 70; the 40-digit run
+# already loses the tail beyond |q| ~ 90): bid offsets at Q = 100, T = 600 for q = -100, -60, 0, 40, 55, 65, 80, 95, 99.
+GLFT_Q100_BIDS = {
+    0.0: (-2.762203414267, -0.557357008213, 3.313045408625, 5.964227825507, 6.880626291862, 7.459403275992, 8.277408299719, 9.036182745936, 9.320167978865),
+    300.0: (-2.760003358452, -0.555232980004, 3.313020732896, 5.962527015553, 6.878569754989, 7.457197664508, 8.275088265986, 9.033847024667, 9.317967923050),
+    599.0: (2.393991169583, 3.225435421055, 3.279432255924, 3.315430145864, 3.328929354562, 3.337928827011, 3.351428035656, 3.364980525255, 4.163973395015),
+}
+GLFT_Q100_QS = (-100, -60, 0, 40, 55, 65, 80, 95, 99)
+
+
+def test_glft_default_Q100_is_finite_monotone_and_exact_over_the_whole_inventory_range():
+    """The default Q = 100 at the paper's parameters: every bid offset finite and strictly increasing in q over
+    -Q .. Q - 1 at T = 600 s and 6.5 h, and equal to the 70-digit reference (GLFT_Q100_BIDS) to 1e-11 at
+    t = 0, 300, 599 -- including q = 65 (7.459403) and q = 99 (9.320168), where v_q / v_0 is 1e-19 and 1e-41.
+    The eigendecomposition (absolute accuracy eps max v) is the wrong tool there: negative entries in its v and
+    a bid at q = 65 off by more than 1 tick (it printed -0.172 before the uniformization)."""
+    g = GLFT2013(T=600.0, Q=100, **GLFT_EX)
+    for t, ref in GLFT_Q100_BIDS.items():
+        bid, ask = g.offsets(np.arange(-100, 101), t)
+        assert np.all(np.isfinite(bid[:-1])) and np.all(np.isfinite(ask[1:]))
+        assert np.all(np.diff(bid[:-1]) > 0) and np.all(np.diff(ask[1:]) < 0)
+        assert np.max(np.abs(bid[[q + 100 for q in GLFT_Q100_QS]] - np.array(ref))) < 1e-11
+        assert np.allclose(bid[:-1], ask[1:][::-1], atol=1e-11)  # delta_b(q) == delta_a(-q)
+    v_eigh = g.v(0.0, method="eigh")
+    assert (v_eigh < 0).any() and (g.v(0.0) > 0).all()
+    b_eigh = np.log(v_eigh[165] / v_eigh[166]) / g.k + np.log1p(g.gamma / g.k) / g.gamma
+    assert not (abs(b_eigh - GLFT_Q100_BIDS[0.0][5]) < 1.0)  # q = 65: eigh is noise, not a quote
+    day = GLFT2013(T=6.5 * 3600.0, Q=100, **GLFT_EX)
+    bid, _ = day.offsets(np.arange(-100, 101), 0.0)
+    assert np.all(np.isfinite(bid[:-1])) and np.all(np.diff(bid[:-1]) > 0)
+
+
+def test_glft_at_6_5h_equals_the_exact_ground_state_by_the_inward_recurrence():
+    """At T = 6.5 h the transients exp(-(w_j - w_0) T) are below 1e-300, so v is the ground state of M, whose
+    tail ratios r_q = v_{q-1} / v_q follow the three-term recurrence r_q = (alpha q^2 - w_0) / eta - 1 / r_{q+1}
+    from r_Q = (alpha Q^2 - w_0) / eta, stable inward: bid(q) = ln(r_{q+1}) / k + c for q = 0 .. Q - 1 must
+    agree with the uniformization to 1e-12 on every q (it does to 6e-14)."""
+    Q = 100
+    g = GLFT2013(T=6.5 * 3600.0, Q=Q, **GLFT_EX)
+    w0 = np.linalg.eigvalsh(g.M)[0]
+    r = np.empty(Q + 1)
+    r[Q] = (g.alpha * Q**2 - w0) / g.eta
+    for q in range(Q - 1, 0, -1):
+        r[q] = (g.alpha * q**2 - w0) / g.eta - 1.0 / r[q + 1]
+    bid_rec = np.log(r[1:]) / g.k + np.log1p(g.gamma / g.k) / g.gamma
+    bid, _ = g.offsets(np.arange(0, Q), 0.0)
+    assert np.max(np.abs(bid - bid_rec)) < 1e-12
+    with pytest.raises(ValueError):
+        GLFT2013(T=600.0, Q=150, **GLFT_EX)  # the ground state spans > 70 decades: not resolvable, refused
 
 
 def test_glft_exact_vs_asymptotic_within_5e3_for_q_up_to_20():
@@ -235,6 +290,34 @@ def _strip():
 def _space_params(T=6.5 * 3600):
     return dict(gamma=0.05, k=20.0, A=0.5, T=T, alpha_s=quoter.per_sqrt_second(0.6),
                 sigma_s=quoter.per_sqrt_second(0.2), tau_s=600.0)
+
+
+def test_price_space_glft_refits_sigma_opt_beyond_one_percent_and_rejects_another_strip():
+    """kind='glft' builds one GLFT2013 per instrument on the first snapshot's sigma_opt and re-fits it when
+    sigma_opt has moved by more than 1 %: an object first used on the sigma 0.2 strip then on a sigma 0.6 one
+    (same instruments) quotes exactly what a fresh object quotes (a review found a 0.0005 $ half-spread bias
+    when it stayed frozen); a snapshot within the tolerance keeps the fitted object; different strikes raise."""
+    f, snap = _strip()
+    n = snap.n_instruments
+    shared = PriceSpace(kind="glft", **_space_params(T=600.0), Q=20)
+    fresh = PriceSpace(kind="glft", **_space_params(T=600.0), Q=20)
+    b1, _ = shared.quotes(snap, np.zeros(n), 0.0)
+    fitted = dict(shared._exact)
+    b2, _ = shared.quotes(snap, np.zeros(n), 0.0)
+    assert np.array_equal(b1, b2) and all(shared._exact[j] is fitted[j] for j in range(n))
+    hot = SyntheticFair(S0=100.0, sigma0=0.6, skew_s=-0.1, curv_c=0.3, alpha=0.6, spot_vol=0.2,
+                        strikes=(90.0, 95.0, 100.0, 105.0, 110.0), expiries=(30 / 365, 90 / 365)).snapshot()
+    bs, as_ = shared.quotes(hot, np.ones(n), 0.0)
+    bf, af = fresh.quotes(hot, np.ones(n), 0.0)
+    refit = np.array([shared._exact[j] is not fitted[j] for j in range(n)])
+    sig_hot = shared.sigma_opt(hot)
+    assert refit.any() and np.array_equal(bs[refit], bf[refit]) and np.array_equal(as_[refit], af[refit])
+    kept = ~refit  # within 1 % of the fitted sigma_opt: the fitted object stays, quotes within 1e-5 $
+    assert np.all(np.abs(sig_hot[kept] / np.array([fitted[j].sigma for j in range(n)])[kept] - 1) <= 0.01)
+    assert np.max(np.abs(bs - bf)) < 1e-5 and np.max(np.abs(as_ - af)) < 1e-5
+    other = SyntheticFair(S0=100.0, sigma0=0.2, strikes=(80.0, 90.0, 100.0, 110.0, 120.0), expiries=(30 / 365,)).snapshot()
+    with pytest.raises(ValueError):
+        shared.quotes(other, np.zeros(other.n_instruments), 0.0)
 
 
 def test_price_space_quotes_straddle_fair_and_skew_with_inventory():

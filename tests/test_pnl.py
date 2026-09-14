@@ -86,6 +86,46 @@ def test_identity_holds_to_1e9_and_matches_a_brute_force_walk(space):
     assert a.spread > 0 and a.hedge_cost > 0
 
 
+def test_identity_bar_scales_with_the_gross_dollars_of_the_run():
+    """At S0 500, multiplier 100 and a +-100-lot opening book over 3600 s (gross ~4e8 $) the rounding of the
+    summed products reaches ~1e-9 (1-2 ulp of a 3e4 $ realised; seed 3 printed gap -1.3e-9), which an absolute
+    1e-9 bar rejected on 3 of 4 correct seeds; the bar is max(1e-9, 1e-12 x scale): the run returns, |gap| <
+    bar, and an independent plain-float walk of the record agrees with every term to 1e-4 (its own rounding
+    at that scale)."""
+    fair = _fair(S0=500.0, strikes=(450.0, 475.0, 500.0, 525.0, 550.0), multiplier=100.0, jump=(20000.0, -0.01, 0.01))
+    q0 = (-100.0, 100.0) * 5
+    for seed in (1, 3):
+        r = run(SimConfig(seconds=3600.0, seed=seed, q0=q0), _price_quoter(T=3600.0), BandHedger(1000.0), fair, replace(FLOW, informed_frac=0.1))
+        a = r.attribution
+        assert a.scale > 1e8 and a.bar == pytest.approx(1e-12 * a.scale) and a.bar > 1e-9
+        assert abs(a.gap) < a.bar and abs(a.split_gap_fills) < a.bar and abs(a.split_gap_theta) < a.bar
+        bf = _brute_force(r)
+        for k, v in bf.items():
+            assert getattr(a, k) == pytest.approx(v, abs=1e-4), k
+    small = run(SimConfig(seconds=120.0, seed=1), _price_quoter(T=120.0), BandHedger(10.0), _fair(), FLOW).attribution
+    assert small.bar == max(pnl.GAP_BAR, pnl.GAP_REL * small.scale) and abs(small.gap) < 1e-11
+    with pytest.raises(AssertionError):
+        pnl.check_identity(replace(small, gap=2.0 * small.bar))
+    with pytest.raises(AssertionError):
+        pnl.check_identity(small, bar=0.0)
+
+
+def test_quotes_inside_fair_carry_a_negative_spread_term_and_the_identity_still_holds():
+    """gamma 50: the linear GLFT skew c + (2q + 1) w / 2 is negative beyond |q| = c / w (~5 lots on the ATM),
+    the quote sits inside fair, the candidate is accepted with probability 1 and the fill's SPREAD term is
+    negative; `Run.n_inside_fair` counts those lots (> 0 here, 0 at gamma 10), the identity is unaffected."""
+    flow = replace(FLOW, informed_frac=0.3)
+    r = run(SimConfig(seconds=600.0, seed=3), _price_quoter(gamma=50.0), BandHedger(10.0), _fair(), flow)
+    f = r.fills
+    per_lot = f["sign"] * (f["fair_at_fill"] - f["px"])
+    assert r.n_inside_fair == int(f.loc[per_lot < 0, "qty"].sum()) > 0
+    assert (per_lot < 0).any() and float((per_lot * f["qty"])[per_lot < 0].sum()) < 0
+    assert abs(r.attribution.gap) < r.attribution.bar
+    assert np.nanmax(r.bids - r.path.prices[:-1]) > 0 or np.nanmin(r.asks - r.path.prices[:-1]) < 0  # some quote crossed fair
+    r10 = run(SimConfig(seconds=600.0, seed=3), _price_quoter(gamma=10.0), BandHedger(10.0), _fair(), flow)
+    assert r10.n_inside_fair == 0 and (r10.fills["sign"] * (r10.fills["fair_at_fill"] - r10.fills["px"]) >= 0).all()
+
+
 def test_pulled_quotes_give_zero_inventory_and_zero_realised():
     """Plan oracle: zero-inventory quoter -> INV = 0 (exactly), and with no hedger every term is 0."""
     r = run(SimConfig(seconds=120.0, seed=1), PulledQuoter(), NoHedger(), _fair(), FLOW)

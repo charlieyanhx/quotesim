@@ -14,7 +14,9 @@ Units and conventions (this module works in SECONDS, shares and $):
   mid S; the whole slippage lives in `cost`, so HEDGE = sum h (S_{t+1} - S_t) and HCOST separate exactly.
 - BandHedger(band_delta_usd): trade to target when |(h - target) * S| > band_delta_usd ($ delta mismatch);
   band 0 -> every step the mismatch is nonzero. TimeHedger(every_s): trade to target when t - t_last >=
-  every_s (and at t = 0 when t_last is None). NoHedger: never trades (h stays at its start).
+  every_s (and at t = 0 when t_last is None), t_last being the last time the rule was DUE (`HedgeDecision.due`,
+  set even when the mismatch was zero and nothing traded), so the grid is anchored at t = 0, not at the first
+  fill. NoHedger: never trades (h stays at its start).
 - band_ww(S, Gamma, lam, gamma, r, tau) = (3/2 e^{-r tau} lam S Gamma^2 / gamma)^{1/3}: the Whalley-Wilmott
   1997 asymptotic no-transaction half-band in SHARES per option around the Black delta, lam = proportional
   cost (fraction of the traded $), gamma = risk aversion, r rate, tau years to expiry (this one argument is
@@ -67,6 +69,7 @@ class HedgeDecision:
     shares: float  # signed trade; 0.0 = no trade
     cost: float  # $ >= 0
     new_h: float  # position after the trade
+    due: bool = False  # the rule fired (a trade to target, possibly of zero size); the sim resets t_last on it
 
     @property
     def traded(self) -> bool:
@@ -80,11 +83,11 @@ class Hedger(Protocol):
 def _trade_to(h: float, target: float, S: float, cost_model: CostFn) -> HedgeDecision:
     dh = float(target - h)
     if dh == 0.0:
-        return HedgeDecision(0.0, 0.0, float(h))
+        return HedgeDecision(0.0, 0.0, float(h), due=True)
     cost = float(cost_model(dh, S))
     if cost < 0:
         raise ValueError("cost model returned a negative cost")
-    return HedgeDecision(dh, cost, float(target))
+    return HedgeDecision(dh, cost, float(target), due=True)
 
 
 def _hold(h: float) -> HedgeDecision:

@@ -1,13 +1,14 @@
 """`quotesim report`: the five README tables from fixed seeds, rendered as markdown between markers.
 
 Everything here is synthetic and seeded; the tables regenerate byte-identically on one machine and are
-printed at a precision (3-4 significant figures, gaps as a power-of-ten ceiling) chosen so that last-ulp
+printed at a precision (3-5 significant figures, gaps as a power-of-ten ceiling) chosen so that last-ulp
 differences between platforms do not change the text. No number in the README comes from anywhere else.
 
 Sections (marker name -> what):
 - identity : the attribution identity over N seeds, half price-space and half vol-space, jumps on:
-             the count of runs with |gap| < 1e-9, the power-of-ten ceiling of max |gap| and of the two
-             sub-split gaps, and the Greek-layer residual relative to the gross inventory move.
+             the count of runs with |gap| < 1e-9 (a measurement: the run-time bar is max(1e-9, 1e-12 x the
+             run's gross $), above 1e-9 at this scale), the power-of-ten ceiling of max |gap|, of the two
+             sub-split gaps and of the bar, and the Greek-layer residual relative to the gross inventory move.
 - as2008   : Avellaneda-Stoikov 2008 Tables 1-3 with THEIR parameters and THEIR fill rule (probability
              lambda(delta) dt per step, one unit per side, arithmetic Brownian mid, P&L marked to mid),
              vectorised over n_sims paths with common random numbers between the inventory and the
@@ -145,7 +146,7 @@ def identity_check(sizes: ReportSizes | None = None) -> pd.DataFrame:
     rows = []
     for i, (name, q) in enumerate(quoters.items()):
         seeds = range(i * half, (i + 1) * half)
-        gaps, fills_gap, theta_gap, resid_rel, fills = [], [], [], [], []
+        gaps, fills_gap, theta_gap, resid_rel, fills, bars = [], [], [], [], [], []
         for seed in seeds:
             r = run(replace(cfg, seed=seed), q, BandHedger(10.0), fair, params)
             a = r.attribution
@@ -155,11 +156,12 @@ def identity_check(sizes: ReportSizes | None = None) -> pd.DataFrame:
             theta_gap.append(abs(a.split_gap_theta))
             resid_rel.append(abs(a.resid) / gross if gross > 0 else 0.0)
             fills.append(r.n_fills)
+            bars.append(a.bar)
         rows.append({
             "quoter": name, "seeds": f"{seeds.start}-{seeds.stop - 1}", "runs with |gap| < 1e-9": f"{sum(g < 1e-9 for g in gaps)}/{len(gaps)}",
             "max |gap|": pow10_ceiling(max(gaps)), "max fill-split gap": pow10_ceiling(max(fills_gap)),
-            "max theta-split gap": pow10_ceiling(max(theta_gap)), "max |RESID| / gross inventory move": pow10_ceiling(max(resid_rel)),
-            "fills per run (mean)": float(np.mean(fills)),
+            "max theta-split gap": pow10_ceiling(max(theta_gap)), "run-time bar": pow10_ceiling(max(bars)),
+            "max |RESID| / gross inventory move": pow10_ceiling(max(resid_rel)), "fills per run (mean)": float(np.mean(fills)),
         })
     return pd.DataFrame(rows)
 
@@ -242,6 +244,20 @@ def matched_half_spreads(gamma: float, seconds: float) -> tuple[np.ndarray, np.n
     return 0.5 * (a - b), 0.5 * (av - bv)
 
 
+def inside_fair_threshold(gamma: float, seconds: float) -> float:
+    """Lots beyond which PriceSpace(glft_asym)'s per-side offset c + (2q + 1) w / 2 is negative on the strip's
+    tightest instrument at t = 0: min_j c / w_j (c = ln(1 + gamma / k) / gamma, w_j the skew per lot of
+    instrument j); the quote then sits inside fair and its fills carry a negative SPREAD term."""
+    fair = strip()
+    ps = price_quoter(gamma, seconds)
+    snap = fair.snapshot()
+    n = snap.n_instruments
+    b0, _ = ps.offsets(snap, np.zeros(n), 0.0)
+    b1, _ = ps.offsets(snap, np.ones(n), 0.0)
+    c = np.log1p(gamma / FLOW["k"]) / gamma
+    return float(np.min(c / (b1 - b0)))
+
+
 def sweep(sizes: ReportSizes | None = None, gammas=GAMMAS, informed=INFORMED, bands=BANDS) -> pd.DataFrame:
     """Paired VolSpace - PriceSpace differences per (gamma, informed_frac, band): realised with its full
     paired summary, the other identity terms as medians."""
@@ -264,6 +280,9 @@ def sweep(sizes: ReportSizes | None = None, gammas=GAMMAS, informed=INFORMED, ba
                        "sign": f"{st['n_pos']}/{st['n_nonzero']}", "boot 95 % CI of mean": f"[{st['boot_lo']:.2f}, {st['boot_hi']:.2f}]"}
                 for term in SWEEP_TERMS[1:]:
                     row[f"{term}: median"] = float(d[term].median())
+                for name in ("price", "vol"):
+                    v = pr.values.xs(name, level="quoter")
+                    row[f"inside fair % ({name})"] = 100.0 * float(v["n_inside_fair"].sum()) / float(v["n_fills"].sum())
                 rows.append(row)
     return pd.DataFrame(rows)
 
@@ -335,7 +354,8 @@ def build(sizes: ReportSizes | None = None) -> dict:
 
 def _strip_line() -> str:
     return (f"S0 {STRIP['S0']:g}, ATM vol {STRIP['sigma0']:g}, skew {STRIP['skew_s']:g}, curvature {STRIP['curv_c']:g}, "
-            f"vol-of-vol {STRIP['alpha']:g} / sqrt(yr), spot vol {STRIP['spot_vol']:g}, strikes {list(STRIP['strikes'])}, "
+            f"vol-of-vol {STRIP['alpha']:g} / sqrt(yr) with kappa_vol {STRIP.get('kappa_vol', 0.0):g} (a floored random walk), "
+            f"spot vol {STRIP['spot_vol']:g}, strikes {list(STRIP['strikes'])}, "
             f"30-day expiry (10 instruments); flow A {FLOW['A']:g} /s/side/instrument, k {FLOW['k']:g} /$, informed horizon {FLOW['h_info']:g} s, p {FLOW['p_informed']:g}")
 
 
@@ -347,8 +367,9 @@ def render(res: dict) -> dict[str, str]:
         f"{md_table(res['identity'], default='{:.1f}')}\n\n"
         f"{s.identity_seeds} seeds ({s.identity_seconds:g} s each, 1 s steps) on the strip ({_strip_line()}), Merton jumps on "
         f"(20,000 / yr, mean -1 %, sd 1 %), informed fraction 0.1, gamma 10, band $10. Gaps are power-of-ten ceilings of the "
-        f"largest absolute gap over the seeds; the identity bar is 1e-9 and `sim.run` raises above it. RESID is the Greek "
-        f"layer's residual (vanna, volga, jumps) over the gross inventory move sum |q dF|."
+        f"largest absolute gap over the seeds; the run-time bar is max(1e-9, 1e-12 x the run's gross $ of summed products), "
+        f"its ceiling in the bar column, and `sim.run` raises above it, so the 1e-9 count is a measurement below the bar. "
+        f"RESID is the Greek layer's residual (vanna, volga, jumps) over the gross inventory move sum |q dF|."
     )
     out["as2008"] = (
         f"{md_table(res['as2008'], fmt={'gamma': '{:g}', 'avg spread': '{:.2f}', 'P&L mean': '{:.1f}', 'P&L sd': '{:.1f}', 'final q mean': '{:.2f}', 'final q sd': '{:.1f}', 'paper: spread': '{:.2f}', 'paper: P&L mean': '{:.1f}', 'paper: P&L sd': '{:.1f}', 'paper: q mean': '{:.2f}', 'paper: q sd': '{:.1f}'})}\n\n"
@@ -359,19 +380,29 @@ def render(res: dict) -> dict[str, str]:
         f"only the direction of each effect and the rough magnitude are reproducible."
     )
     hs_p, hs_v = matched_half_spreads(10.0, s.sweep_seconds)
+    q_inside = " / ".join(f"{inside_fair_threshold(g, s.sweep_seconds):.1f}" for g in GAMMAS)
+    sw = res["sweep"]
+    hit = sorted(set(sw.loc[(sw["inside fair % (price)"] > 0) | (sw["inside fair % (vol)"] > 0), "gamma"]))
+    hit_line = f"the gamma {' and '.join(f'{g:g}' for g in hit)} cells reach that regime" if hit else "no cell reaches that regime"
+    sw_disp = sw.drop(columns=["inside fair % (price)", "inside fair % (vol)"]).assign(**{
+        "lots inside fair, % (price / vol)": [f"{a:.2f} / {b:.2f}" for a, b in zip(sw["inside fair % (price)"], sw["inside fair % (vol)"], strict=True)]})
     sw_fmt = {"gamma": "{:g}", "informed": "{:g}", "band $": "{:g}", "realised: median": "{:+.2f}"}
     sw_fmt.update({f"{t}: median": "{:+.2f}" for t in SWEEP_TERMS[1:]})
     out["sweep"] = (
-        f"{md_table(res['sweep'], fmt=sw_fmt)}\n\n"
+        f"{md_table(sw_disp, fmt=sw_fmt)}\n\n"
         f"v0.1 sensitivity table, not the note's result: {s.sweep_seeds} paired seeds x {s.sweep_seconds:g} s per cell, "
         f"VolSpace matched to PriceSpace(GLFT asymptotic) at q = 0 (same summed $ half-spread and the same summed linearised "
         f"$ skew per lot), differences are vol minus price per seed in $; markout horizon 60 s; the hedge is a $-delta band "
         f"with the default sqrt-law cost model. Sign = seeds with a positive difference / seeds with a nonzero one; the CI "
-        f"is a 2,000-resample bootstrap of the mean. n_fills and vega_T are counts, not $. The matching equates the SUM of "
+        f"is a 2,000-resample bootstrap of the mean. n_fills is a count and vega_T the terminal net vega in $ per 1.00 vol; "
+        f"neither is a $ P&L term. The matching equates the SUM of "
         f"the $ half-spreads, not their shape: at gamma 10 and q = 0 the price-space half-spread is "
         f"{hs_p.min():.3f}-{hs_p.max():.3f} $ on every strike while the matched vol-space one runs {hs_v.min():.3f} $ at the "
         f"wings to {hs_v.max():.3f} $ at the money, so the vol quoter fills the wings more often at less capture each; the "
-        f"spread column, not the inventory skew, carries most of every cell."
+        f"spread column, not the inventory skew, carries most of every cell. The last column is the share of lots filled at "
+        f"a quote INSIDE fair (the per-side offset c + (2q + 1) w / 2 is negative beyond |q| = c / w, which is "
+        f"{q_inside} lots on the tightest instrument at gamma {' / '.join(f'{g:g}' for g in GAMMAS)}); those fills carry a "
+        f"negative SPREAD term, the maker paying to unwind; {hit_line}."
     )
     mk_fmt = {"horizon_s": "{:g}", "realised_spread_mean": "{:.4f}", "adverse_mean": "{:+.4f}", "markout_mean": "{:+.4f}",
               "se_clustered": "{:.4f}", "realised_spread_vp": "{:.3f}", "adverse_vp": "{:+.3f}", "markout_vp": "{:+.3f}", "se_clustered_vp": "{:.3f}"}

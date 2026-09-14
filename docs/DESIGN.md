@@ -36,7 +36,8 @@ With `F_t` the fair price vector, `S_t` spot, `q_t` the lots held over step t (a
 `h_t` the hedge shares held over step t, fills `f = (t_f, j, dq_f, px_f)` and hedge trades with cost `c`:
 
 ```
-SPREAD = sum_f dq_f (F_{t_f} - px_f)          realised half-spread on every fill
+SPREAD = sum_f dq_f (F_{t_f} - px_f)          realised half-spread on every fill (negative for a fill at a quote
+                                              inside fair, see section 6)
 INV    = sum_t q_t . (F_{t+1} - F_t)          option positions marked step by step
 HEDGE  = sum_t h_t (S_{t+1} - S_t)            hedge shares marked step by step
 HCOST  = sum_hedge trades c
@@ -48,10 +49,16 @@ Why it is exact: every cash flow or mark change in the loop is one of the four. 
 by `-dq px` and the mark by `+dq F` (their sum is the fill's spread term); a hedge trade moves cash by
 `-dh S - c` and the mark by `+dh S` (net `-c`); holding moves the marks by `q dF` and `h dS`. Summing the
 step-by-step marks telescopes to the terminal marks minus the opening ones. Every sum is a `math.fsum`
-over the elementwise products and `cash_T` is a `math.fsum` over the flows, so `gap = R - (sum)` is a
-rounding residual of order 1e-12 on $-scale runs. `sim.run` calls `pnl.check_identity` on every run and
-raises `AssertionError` with the numbers if `|gap| >= 1e-9`; the tests do the same and also re-derive the
-four terms with plain floats from the raw fill and hedge records.
+over the elementwise products and `cash_T` is a `math.fsum` over the flows, so `gap = R - (sum)` is the
+rounding of the products themselves (each within 2 ulp), bounded by `2 eps * scale` with `scale` the gross $
+of every summed product (fills, hedge trades and costs, opening and terminal marks, gross inventory and
+hedge marks; `Attribution.scale`): of order 1e-12 on $-scale runs and ~1e-9 at multiplier 100 on a 500 $
+underlying with a 100-lot opening book (scale ~1e8-1e9 $). `sim.run` calls `pnl.check_identity` on every
+run and raises `AssertionError` with the numbers if `|gap| >= bar = max(1e-9, 1e-12 * scale)` (deviation
+D11: the relative part is 4,500x the rounding bound and 1e12 below one product, the absolute floor is where
+$-scale runs sit; ~1e-7 on the README's strip, where the measured gaps are below 1e-11); the tests do the
+same and also re-derive the four terms with plain floats from the raw fill and hedge records, at multiplier
+1 and at multiplier 100 / S0 500.
 
 Two sub-splits of `INV`, both exact by the fill decomposition `q_t = q_0 + sum_{f: t_f <= t} dq_f`:
 
@@ -70,8 +77,9 @@ The Greek explanation layer is the only place with a residual: `INV_greek = sum_
 Gamma dS^2 + Vega dsigma + theta dt)` with `dsigma` each instrument's own fair-vol change (sticky strike,
 so the smile move from `dk = -dS / S` sits in the vega term, not in delta), `RESID = INV - INV_greek`
 (vanna, volga, third order, jumps). The identity table reports `max |RESID| / sum |q dF|` with Merton jumps
-on; it is at the 1e-2 level there because a jump is not a second-order expansion, and at the 1e-5 level
-without jumps (tests/test_pnl.py).
+on; it is at the 1e-2 level there because a jump is not a second-order expansion, below 1e-4 on the
+five-strike strip without jumps (the wings' volga at vol-of-vol 0.6), and below 1e-5 for one ATM strike at
+vol-of-vol 0.16; tests/test_pnl.py asserts 1e-3 and 1e-5 respectively (deviation D12).
 
 ## 4. Common random numbers and the paired harness
 
@@ -102,8 +110,10 @@ An informed candidate (probability `informed_frac`) reads the fair `h_info` seco
 path (`FairPath.prices[min(i + h_steps, n_steps)]`) and trades WITH the move with probability `p_informed`,
 AGAINST it otherwise, so `E[adverse_h] = -(2p - 1) E|F_{t+h} - F_t|` and `p = 0.5` is uninformative (see
 deviation D1). This look-ahead is a property of the counterparty in a simulation; nothing on the quoting
-side can read it: the quoter is fed `PastOnlyFair.current()`, and `PastOnlyFair.snapshot(i)` raises
-`FutureAccessError` for any `i` beyond the clock (tested). Uninformed candidates are 50/50 with optional
+side can read it: the quoter is fed `PastOnlyFair.current()`, `PastOnlyFair.snapshot(i)` raises
+`FutureAccessError` for any `i` beyond the clock, and every snapshot is a read-only copy of one row, so no
+numpy view of the pre-drawn path (whose `.base` would be the whole future) reaches the quoter and an
+in-place write in a quoter cannot corrupt the fair the run marks against (tested). Uninformed candidates are 50/50 with optional
 Markov persistence (`persist`) using the direction uniforms they would otherwise not consume, so the streams
 are unchanged.
 
@@ -112,18 +122,39 @@ are unchanged.
 - `AS2008(gamma, k, sigma, T)`: reservation `r = s - q gamma sigma^2 (T - t)`, spread `gamma sigma^2 (T - t)
   + (2 / gamma) ln(1 + gamma / k)`. Its linear-in-`(T - t)` term dominates at the open with an intraday `T`,
   so it is not the default.
-- `GLFT2013(gamma, k, sigma, A, T, Q=100)`: the exact finite-inventory solution. The matrix exponential of the
-  `(2Q + 1)` tridiagonal generator is taken by eigendecomposition of the symmetric matrix with its spectrum
-  shifted by the minimum eigenvalue (every quote is a ratio `v_q / v_{q +- 1}`, so the scale is free); raw
-  `scipy.linalg.expm` overflows at an intraday horizon (`v ~ 1e170` at `T = 600 s`) and is kept behind
-  `v(t, method="expm")` with a test asserting equality to 1e-10 relative.
+- `GLFT2013(gamma, k, sigma, A, T, Q=100)`: the exact finite-inventory solution. `v(t) = exp(-M' (T - t)) 1`
+  with `M' = M - w_min I` (the spectrum shifted by its minimum eigenvalue: every quote is a ratio
+  `v_q / v_{q +- 1}`, so the scale is free) is evaluated by uniformization: `Lambda = max diag(M')`,
+  `P = I - M' / Lambda >= 0` entrywise, `v = sum_n Poisson(n; Lambda (T - t)) P^n 1`, every term non-negative,
+  so each entry has relative accuracy (~1e-12) however small it is. The powers `P^n 1` are cached per object up
+  to the first `n` where the slowest even mode is below 1e-12 relative (ratio test scaled by the spectral gap)
+  or the last `n` with Poisson weight at `T`, the Poisson weights come from the ratio recursion anchored at
+  the mode, the terms beyond the cache are collapsed onto the last power with the exact tail mass. The
+  eigendecomposition (`v(t, method="eigh")`) and raw `scipy.linalg.expm` (`method="expm"`; it overflows
+  unshifted, `v ~ 1e170` at `T = 600 s`) are kept for cross-checks: both have ABSOLUTE accuracy `eps max(v)`,
+  and since `v_q` decays like `exp(-1/2 sqrt(alpha / eta) q^2)`, their tail is rounding noise once
+  `v_q / v_0 < ~1e-8` (|q| > ~50 at the paper's parameters with the default Q = 100: negative entries, a bid
+  at q = 65 of -0.17 instead of 7.46, NaN beyond q = 70). Tested: uniformization = eigh = expm to 1e-10
+  relative at Q = 30; every offset finite and monotone in q over -Q .. Q at T = 600 s and 6.5 h with Q = 100;
+  equality with a 70-digit reference at nine q's and three t's to 1e-11; equality with the exact
+  long-horizon ground state (inward three-term recurrence) on every q at 6.5 h to 1e-12. A Q whose ground
+  state spans more than 70 decades (beyond the Poisson window's exp(-200) tail bound) raises at construction.
 - `GLFTAsymptotic(gamma, k, sigma, A)`: the closed form; the default for intraday horizons. `|exact -
   asymptotic| <= 5e-3` for `|q| <= 20` at the plan's parameters (tested), and the spread-vs-gamma dip is a
   regression test.
 - `PriceSpace(kind, ...)`: the scalar rule per instrument on the option price with `sigma_opt^2 = (Vega_j
   alpha)^2 + 1/2 Gamma_j^2 sigma^4 S^4 tau` (hedged residual; the delta term is added only with
-  `hedged=False`, otherwise hedged risk is penalised twice). For `kind="glft"` the per-instrument
-  `sigma_opt` is frozen at the first `quotes` call (one eigendecomposition per instrument).
+  `hedged=False`, otherwise hedged risk is penalised twice). For `kind="glft"` one `GLFT2013` per instrument
+  is built at the first `quotes` call on that snapshot's `sigma_opt` and re-built whenever `sigma_opt` has
+  moved by more than 1 % from the fitted value (`PriceSpace.SIGMA_REFIT_TOL`), so the exact quotes track the
+  surface to that tolerance within a run and across strips of the same instruments (a review found a
+  0.0005 $ half-spread bias when the first fit stayed frozen on a much hotter surface); a snapshot with
+  different strikes or rights raises. The
+  linear skew of `as` and `glft_asym`, `c + (2q + 1) w / 2`, is negative beyond `|q| = c / w` (about 107 /
+  26 / 5 lots for the tightest instrument at gamma 1 / 10 / 50 on the report's strip): the quote then sits
+  inside fair, `flow.accept_prob` treats a negative distance as zero (accepted with probability 1), and the
+  fill's SPREAD term is negative, the maker paying to unwind. Nothing floors or pulls such a quote (it is
+  the model's optimal quote); `Run.n_inside_fair` counts those lots and the sweep table prints their share.
 - `VolSpace(gamma, alpha_s, sigma_s, tau_s, hs_vol, skew_scale)`: a parallel surface shift `skew_vol(j) =
   gamma alpha^2 tau V_net + 1/2 gamma sigma^4 S^4 tau^2 Gamma_net (Gamma_j / Vega_j)`, `bid_vol = sigma_fair
   - skew - hs_vol`, `ask_vol = sigma_fair - skew + hs_vol`, priced with Black. Long vega lowers both quotes.
@@ -133,13 +164,19 @@ are unchanged.
   `skew_scale = sum(price-space $ skew per lot) / sum(vol-space $ skew per lot)` at `q = 0`, plus a
   `MatchReport`. The matching equates sums, not shapes: constant `hs_vol` is tight in $ at the wings and
   wide at the money, which is what the sweep table measures first (its caption says so with the numbers).
+  The research memo matched at the ATM vega instead (`hs_vol = hs_$ / Vega_ATM`); the plan and the code match
+  the sum, so the ATM $ half-spread is not equal after matching (0.041 $ price-space vs 0.073 $ vol-space
+  at gamma 10, see the sweep caption); see deviation D7.
 - Guards: `round_to_tick` (bids down, asks up; a bid `<= 0` is pulled even at `tick = 0`), `MaxLossGuard`,
   `vega_cap`. No size rules in v0.1.
 
 ## 7. Hedger
 
 `BandHedger(band_delta_usd, cost_model)` rehedges to `target = -sum_j q_j Delta_j multiplier` when the
-$-delta mismatch `|h - target| S` exceeds the band; `TimeHedger(every_s)` on a grid; `NoHedger` never. The
+$-delta mismatch `|h - target| S` exceeds the band; `TimeHedger(every_s)` on the grid `0, every_s, 2 every_s,
+...` from the start of the run (`HedgeDecision.due` marks the rule firing even when the mismatch is zero and
+nothing trades, and `sim.run` resets `t_last` on `due`, not on a trade, so the grid is not re-anchored at the
+first fill); `NoHedger` never. The
 default `CostModel(half_spread=0.01, Y=0.5, sigma_daily=0.01, adv=5e7)` is `half_spread |dh| + Y sigma_daily
 sqrt(|dh| / ADV) S |dh|`, tcakit's sqrt-law form with `Y` a labelled constant (tcakit has no impact predictor
 to call, and it is not imported). `band_ww(S, Gamma, lam, gamma, r, tau) = (3/2 e^{-r tau} lam S Gamma^2 /
@@ -150,6 +187,8 @@ beside the simulated band frontier for comparison by eye, not as an equation.
 
 `MO_h(f) = s_f (F_{t_f + h} - px_f) = realised spread + adverse`, against fair, `t_f + h` clipped at the end
 of the run exactly as `ADVERSE_h`, so `adverse_mean(all, h_markout) * n == attribution.adverse_h` (tested).
+A horizon that is not a positive whole number of steps raises (`adverse.horizon_steps`, shared with
+`pnl.attribute`) rather than being rounded to whole steps under the requested label.
 Vol points divide by the fill's fair vega (fills below `VEGA_FLOOR` are left out of the vol-point means and
 counted in `n_vp`). The SE is cluster-robust with fills clustered by time bucket of width `h` (fills inside
 one horizon share the fair path); it is NaN with fewer than two buckets, which is why the 300 s row of the
@@ -180,8 +219,11 @@ reproducible.
   The Binomial quantile at the cell's uniform keeps the thinned count exactly Poisson, reduces to `U < p`
   for one candidate, and is monotone in `p` (the CRN superset property). The informed flag and direction
   are per cell.
-- D3 (quoter, GLFT exact). Eigendecomposition with a spectrum shift instead of `expm` (overflow at intraday
-  horizons); `expm` kept as a method and tested equal.
+- D3 (quoter, GLFT exact). Uniformization of the shifted generator instead of `expm` (overflow at intraday
+  horizons) and instead of the eigendecomposition the first implementation used (absolute accuracy only:
+  its tail was rounding noise beyond |q| ~ 50 at the default Q = 100, a wrong sign at q = 65 and NaN beyond
+  q = 70 at every horizon >= 600 s); `eigh` and `expm` kept as methods and tested equal where resolvable
+  (Q = 30). See section 6 for the tests over the whole inventory range.
 - D4 (units). `fair.py` in years, everything else in seconds; `per_sqrt_second` converts. `band_ww`'s `tau`
   is in years.
 - D5 (fair). ATM vol is an arithmetic OU floored at `VOL_FLOOR`, not lognormal, so `alpha` is the absolute
@@ -190,24 +232,39 @@ reproducible.
   the exact discrete `ln(1 + p_J kappa_J)`, which keeps `E[S_{t+dt}] = S_t` for any `dt` where the continuous
   `lam kappa_J dt` failed a 1e-3 test at `lam dt = 0.5`. `vol(k, T)` has no term structure; Greeks are
   sticky-strike Black partials; `r = q = 0`.
-- D6 (fair, extra objects). `FairPath` (the whole pre-drawn path, vectorised pricing) and `PastOnlyFair`
-  (clock plus `FutureAccessError`) beyond the plan's "a mock that raises", so the leak guard is on in every
-  run. `SyntheticFair.step` mutates in place; `run` builds the path on a copy and leaves the caller's object
-  untouched (tested).
+- D6 (fair, extra objects). `FairPath` (the whole pre-drawn path, vectorised pricing, read-only arrays) and
+  `PastOnlyFair` (clock plus `FutureAccessError`) beyond the plan's "a mock that raises", so the leak guard is
+  on in every run; `FairPath.snapshot` hands out read-only copies of one row (a view's `.base` would have been
+  the whole future, and a writable view an in-place corruption of the fair; both tested). `SyntheticFair.step`
+  mutates in place; `run` builds the path on a copy and leaves the caller's object untouched (tested).
 - D7 (quoter, matching). `match_spreads` returns `(VolSpace, MatchReport)` and matches the skew as well as
   the spread (`skew_scale` is 1.0 by algebra for AS2008 at `tau = T - t`, tested, and not 1 for the
-  asymptotic quoter). No size rules; a deep-OTM bid below a wide half-spread is pulled rather than quoted
-  negative.
+  asymptotic quoter). The research memo (report_a3e5dd section 3) matched the half-spread at the ATM vega;
+  the plan and the code equate the SUM of the $ half-spreads, so after matching the ATM $ half-spread is
+  0.041 (price space) vs 0.073 (vol space) at gamma 10, a 75 % difference the sweep caption reports. No size
+  rules; a deep-OTM bid below a wide half-spread is pulled rather than quoted negative.
 - D8 (hedger). `decide(h, target, S, t, t_last)` returns a `HedgeDecision` rather than mutating; the hedge
-  fills at the mid with the slippage in `cost`; `TimeHedger` trades at `t = 0` when `t_last` is None;
-  `NoHedger` and `target_shares` added.
+  fills at the mid with the slippage in `cost`; `TimeHedger` trades at `t = 0` when `t_last` is None and
+  `HedgeDecision.due` (the rule fired, even with a zero mismatch) is what advances `t_last`, so the grid is
+  anchored at `t = 0` rather than at the first nonzero mismatch; `NoHedger` and `target_shares` added.
 - D9 (sim). `SimConfig` adds `q0` and `h0` (opening inventory and hedge) so `OPENING` is exercised; `Run`
   keeps the full quote arrays (`bids`, `asks`) for diagnostics; `paired` takes `hedger`, `fair`, `params`
   as keyword arguments and an optional per-quoter `hedgers` map.
 - D10 (report). The identity table is 50 seeds per quoter (100 in total) at 600 s, not full days, to keep
-  `quotesim report` under about 3 minutes (per-step cost: `flow.arrivals` ~65 us, `PriceSpace.quotes` ~50
-  us, `VolSpace.quotes` ~180 us at 10 instruments). The sweep is 16 paired seeds per cell and is labelled a
+  `quotesim report` under about 3 minutes on the machine the README names (the per-step costs are not
+  printed by any script, so none are quoted here). The sweep is 16 paired seeds per cell and is labelled a
   v0.1 sensitivity table; the note needs >= 200 seeds and a pre-registered metric.
+- D11 (pnl, the bar). The plan's `|gap| < 1e-9` is a $-scale statement, not an identity statement: the gap
+  is 1-2 ulp of the summed products, so at multiplier 100 on a 500 $ underlying with a 100-lot opening book
+  a correct 3600 s run printed gaps of -1.0e-9 to -1.3e-9 and was rejected. The bar is
+  `max(1e-9, 1e-12 * scale)` (section 3); the identity table prints the bar's ceiling beside the gaps, and
+  its `runs with |gap| < 1e-9` column is a measurement because the run-time bar sits above 1e-9 there.
+- D12 (pnl, RESID). The plan's oracle `RESID < 1e-5 |INV|` holds for one ATM strike at vol-of-vol 0.16 and
+  is relaxed to `1e-3 * sum |q dF|` on the five-strike strip at vol-of-vol 0.6 (the wings' volga; measured
+  below 1e-4), the two bounds tests/test_pnl.py asserts.
+- D13 (adverse, horizons). A markout or attribution horizon must be a positive whole number of steps; a
+  fractional or sub-step horizon raises instead of being rounded to whole steps under the requested label
+  (two rows would otherwise carry the same markout and a different cluster width).
 
 ## 11. Reserved for v0.2
 

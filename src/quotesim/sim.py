@@ -5,7 +5,9 @@ Units and conventions (SECONDS on the clock, $ per unit of underlying times the 
 - one step of `dt` seconds: quote update (the quoter reads the past-only fair at the clock and the
   current inventory) -> fills (flow.arrivals thins the pre-drawn candidates against the quotes; the
   informed counterparty reads the fair h_info ahead on the pre-drawn path) -> hedge check (the rule sees the
-  option delta at the clock) -> state step (the clock advances; positions are marked from F_t to F_{t+1}).
+  option delta at the clock; `t_last` is the last time the rule was DUE, whether or not the mismatch was
+  zero, so a TimeHedger's grid is 0, every_s, 2 every_s, ... from the start of the run) -> state step (the
+  clock advances; positions are marked from F_t to F_{t+1}).
   Fills at step i are priced at the quotes of step i and marked at F_i; the position they create is held
   over step i -> i + 1 (that is why `positions[i + 1]` is "held over step i").
 - cash: an option fill moves cash by -sign * lots * px * multiplier; a hedge trade by -dh * S - cost (the
@@ -16,7 +18,8 @@ Units and conventions (SECONDS on the clock, $ per unit of underlying times the 
   two quoters under the same seed see the same spot / vol / jump path, the same candidate arrivals, the
   same uniforms, the same informed flags and directions; they differ only through thinning and their own
   hedges (common random numbers by construction; a tighter quote's fills are a superset of a wider one's).
-- the identity |gap| < 1e-9 (pnl.check_identity) is asserted inside `run`, on every run, not only in tests.
+- the identity |gap| < bar = max(1e-9, 1e-12 x the run's gross $) (pnl.check_identity) is asserted inside `run`,
+  on every run, not only in tests.
 - `paired` keeps only the attribution and a few counts per (seed, quoter), never the runs; `PairedResult.table`
   reports paired differences per identity term: median, IQR, p5 / p95, sign count with its two-sided
   binomial p, and a seeded bootstrap 95 % CI of the mean. Never the best seed; never an unpaired t-test.
@@ -95,6 +98,15 @@ class Run:
         return int(len(self.hedges))
 
     @property
+    def n_inside_fair(self) -> int:
+        """Lots filled at a quote INSIDE fair (sign * (fair - px) < 0): the per-side offset had gone negative."""
+        if not len(self.fills):
+            return 0
+        f = self.fills
+        inside = (f["sign"].to_numpy(dtype=float) * (f["fair_at_fill"].to_numpy(dtype=float) - f["px"].to_numpy(dtype=float))) < 0
+        return int(f["qty"].to_numpy(dtype=np.int64)[inside].sum())
+
+    @property
     def terminal_inventory(self) -> np.ndarray:
         return self.positions[-1]
 
@@ -102,7 +114,7 @@ class Run:
         """Counts and the identity terms in one flat dict (what `paired` keeps)."""
         d = self.attribution.as_dict()
         d.update(
-            n_fills=self.n_fills, n_hedges=self.n_hedges, n_candidates=self.n_candidates,
+            n_fills=self.n_fills, n_hedges=self.n_hedges, n_candidates=self.n_candidates, n_inside_fair=self.n_inside_fair,
             abs_q_T=float(np.abs(self.terminal_inventory).sum()),
             vega_T=float(np.sum(self.terminal_inventory * self.path.vegas[-1] * self.multiplier)),
         )
@@ -172,10 +184,12 @@ def run(config: SimConfig, quoter: Quoter, hedger: Hedger, fair: SyntheticFair, 
         S = float(path.spot[i])
         target = target_shares(q, path.deltas[i], mult)
         dec = hedger.decide(h, target, S, t, t_last)
+        if dec.due:
+            t_last = t
         if dec.traded:
             flows.append(-dec.shares * S - dec.cost)
             running += -dec.shares * S - dec.cost
-            h, t_last = dec.new_h, t
+            h = dec.new_h
             hedge_rows.append((t, i, dec.shares, dec.cost, S, h))
         positions[i + 1], hedge_pos[i + 1], cash[i + 1] = q, h, running
         view.advance()

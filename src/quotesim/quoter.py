@@ -13,10 +13,17 @@ in the papers' examples, $ per unit of underlying in the strip wrappers):
 - GLFT2013 exact (their Prop 2 / Thm 1, finite inventory |q| <= Q): v(t) = exp(-M (T - t)) 1 with M the
   (2Q + 1) tridiagonal matrix diag(alpha q^2), off-diagonal -eta, alpha = k gamma sigma^2 / 2,
   eta = A (1 + gamma/k)^{-(1 + k/gamma)}; bid_offset(q) = (1/k) ln(v_q / v_{q+1}) + (1/gamma) ln(1 + gamma/k),
-  ask_offset(q) = (1/k) ln(v_q / v_{q-1}) + ...; no bid at q = Q, no ask at q = -Q (offset = inf). M is
-  symmetric, so the matrix exponential is computed by eigendecomposition (identical to scipy.linalg.expm
-  to 1e-10 relative, tested) with the spectrum shifted by its minimum so v stays O(1) at a 6.5 h horizon;
-  the boundary effect of a finite Q is ~0.008 tick at Q = 30, so Q defaults to 100.
+  ask_offset(q) = (1/k) ln(v_q / v_{q-1}) + ...; no bid at q = Q, no ask at q = -Q (offset = inf). v is
+  computed by UNIFORMIZATION (Jensen 1953): with M' = M - w_min I (w_min the smallest eigenvalue, a free
+  scale since every quote is a ratio), Lambda = max diag(M') and P = I - M' / Lambda >= 0 entrywise,
+  v(t) = sum_n Poisson(n; Lambda (T - t)) P^n 1, every term non-negative, so each v_q carries RELATIVE
+  rounding error (~1e-12) however small it is. v_q decays like exp(-1/2 sqrt(alpha/eta) q^2) (the ground
+  state of the discrete oscillator), so a method with ABSOLUTE accuracy eps max(v) -- the eigendecomposition
+  (kept as `v(t, method="eigh")`) or scipy.linalg.expm (`method="expm"`) -- returns rounding noise for
+  |q| beyond ~50 at the paper's parameters (v_q / v_0 < 1e-8): tested against both at Q = 30, against
+  the exact long-horizon ground state (inward three-term recurrence) at Q = 100, and for finiteness and
+  monotonicity over the whole -Q..Q range. The boundary effect of a finite Q is ~0.008 tick at Q = 30, so
+  Q defaults to 100; a Q whose ground state spans more than ~70 decades raises at construction.
 - GLFTAsymptotic (their Prop 3, T -> infinity):
     bid_offset = c + ((2q + 1)/2) w, ask_offset = c - ((2q - 1)/2) w, c = (1/gamma) ln(1 + gamma/k),
     w = sqrt(sigma^2 gamma / (2 k A) (1 + gamma/k)^{1 + k/gamma}). Default for intraday horizons (A-S is
@@ -51,6 +58,7 @@ from typing import Protocol
 
 import numpy as np
 from scipy.linalg import expm
+from scipy.special import pdtrc
 
 from quotesim.fair import VOL_FLOOR, YEAR_SECONDS, FairSnapshot, black_price
 
@@ -142,6 +150,10 @@ class GLFTAsymptotic:
 class GLFT2013:
     """Exact finite-inventory GLFT quotes; see module docstring. `offsets(q, t)` vectorises over q."""
 
+    WINDOW = 20.0  # Poisson window half-width in sd units (+ WINDOW^2 terms): dropped mass <= exp(-200)
+    TRANSIENT = 1e-12  # relative size of the slowest even mode left in P^n 1 when the powers stop
+    MIN_RANGE = 1e-70  # min / max of the ground state that the window still resolves to 1e-12
+
     def __init__(self, gamma: float, k: float, sigma: float, A: float, T: float, Q: int = 100):
         _check_positive(gamma=gamma, k=k, A=A, T=T)
         if sigma < 0 or Q < 1:
@@ -153,17 +165,72 @@ class GLFT2013:
         self.M = np.diag(self.alpha * qs**2) - self.eta * (np.eye(2 * Q + 1, k=1) + np.eye(2 * Q + 1, k=-1))
         self._w, self._U = np.linalg.eigh(self.M)
         self._Ut1 = self._U.T @ np.ones(2 * Q + 1)
+        self._shift = float(self._w[0])
+        self.Lambda = float(self.alpha * Q**2 - self._shift)  # max diag of M - w_min I
+        self._p_diag = 1.0 - (self.alpha * qs**2 - self._shift) / self.Lambda  # >= 0, == 0 at |q| = Q
+        self._p_off = self.eta / self.Lambda
+        self._W = self._powers()
+        self.n_cut = self._W.shape[0] - 1
+        w_end = self._W[-1]
+        if w_end.min() < self.MIN_RANGE * w_end.max():
+            raise ValueError(f"Q = {Q} spans more than {-np.log10(self.MIN_RANGE):.0f} decades of v at these parameters; lower Q")
 
-    def v(self, t: float = 0.0, method: str = "eigh") -> np.ndarray:
+    def _n_max(self, mu: float) -> int:
+        return int(np.ceil(mu + self.WINDOW * np.sqrt(mu) + self.WINDOW**2))
+
+    def _powers(self) -> np.ndarray:
+        """Rows w_n = P^n 1 (all entries >= 0) up to the first n where the slowest even mode of P is below
+        TRANSIENT relative (ratio test scaled by the spectral gap), or the last n with Poisson weight at tau = T."""
+        n_max = self._n_max(self.Lambda * self.T)
+        gap = (self._w[2] - self._w[0]) / self.Lambda if self._w.shape[0] > 2 else 1.0
+        tol = self.TRANSIENT * gap
+        rows = [np.ones(2 * self.Q + 1)]
+        for _ in range(n_max):
+            w = rows[-1]
+            nxt = self._p_diag * w
+            nxt[1:] += self._p_off * w[:-1]
+            nxt[:-1] += self._p_off * w[1:]
+            rows.append(nxt)
+            if np.max(np.abs(nxt / w - 1.0)) <= tol:
+                break
+        return np.array(rows)
+
+    def v(self, t: float = 0.0, method: str = "uniform") -> np.ndarray:
         """v(t) = exp(-(M - w_min I) (T - t)) 1, indexed by q + Q: the paper's v scaled by the constant
         exp(w_min (T - t)) (w_min = smallest eigenvalue of M) so entries stay O(1) at any horizon; every
-        quote is a ratio v_q / v_{q +- 1}, unchanged by the scaling."""
+        quote is a ratio v_q / v_{q +- 1}, unchanged by the scaling. method: "uniform" (default, relative
+        accuracy in every entry), "eigh" / "expm" (absolute accuracy eps max(v): the tail is noise)."""
         if not 0.0 <= t <= self.T:
             raise ValueError("t must be in [0, T]")
-        shift = float(self._w.min())
+        if method == "uniform":
+            return self._v_uniform(self.Lambda * (self.T - t))
         if method == "expm":
-            return expm(-(self.M - shift * np.eye(2 * self.Q + 1)) * (self.T - t)) @ np.ones(2 * self.Q + 1)
-        return self._U @ (np.exp(-(self._w - shift) * (self.T - t)) * self._Ut1)
+            return expm(-(self.M - self._shift * np.eye(2 * self.Q + 1)) * (self.T - t)) @ np.ones(2 * self.Q + 1)
+        if method == "eigh":
+            return self._U @ (np.exp(-(self._w - self._shift) * (self.T - t)) * self._Ut1)
+        raise ValueError("method must be 'uniform', 'eigh' or 'expm'")
+
+    def _v_uniform(self, mu: float) -> np.ndarray:
+        """sum_n Poisson(n; mu) w_n with the terms n >= n_cut collapsed onto w_{n_cut} (converged or
+        weightless), the Poisson weights from the recursion p_{n+1} / p_n = mu / (n + 1) anchored at the
+        mode and normalised to 1 - P(N >= n_cut), so every factor is positive and relative."""
+        if mu == 0.0:
+            return self._W[0].copy()
+        lo = max(0, int(np.floor(mu - self.WINDOW * np.sqrt(mu) - self.WINDOW**2)))
+        hi = min(self.n_cut, self._n_max(mu) + 1)
+        rest = float(pdtrc(self.n_cut - 1, mu))  # P(N >= n_cut)
+        if hi <= lo:
+            return rest * self._W[self.n_cut]
+        n0 = int(np.clip(np.floor(mu), lo, hi - 1))
+        logw = np.zeros(hi - lo)
+        up = np.arange(n0 + 1, hi)
+        if up.size:
+            logw[n0 + 1 - lo:] = np.cumsum(np.log(mu / up))
+        dn = np.arange(n0, lo, -1)
+        if dn.size:
+            logw[: n0 - lo] = np.cumsum(np.log(dn / mu))[::-1]
+        om = np.exp(logw)
+        return (1.0 - rest) * (om @ self._W[lo:hi]) / om.sum() + rest * self._W[self.n_cut]
 
     def offsets(self, q, t: float = 0.0):
         q = np.asarray(q)
@@ -241,8 +308,13 @@ _KINDS = ("as", "glft", "glft_asym")
 class PriceSpace:
     """Per-instrument scalar rule on the option price. kind in {'as', 'glft', 'glft_asym'}; gamma per $;
     k per $; A per second; T horizon in seconds (AS and GLFT exact); alpha_s, sigma_s per sqrt(second);
-    tau_s seconds; tick in $. For kind='glft' the per-instrument sigma_opt is frozen at the first call
-    (one eigendecomposition per instrument) and reused; Q is its inventory bound."""
+    tau_s seconds; tick in $. For kind='glft' one GLFT2013 per instrument is built at the first call on that
+    snapshot's sigma_opt and re-built whenever sigma_opt has moved by more than SIGMA_REFIT_TOL (1 %) from the
+    fitted value (a few ms per build), so the exact quotes track the surface to that tolerance -- across a
+    run and across different strips of the same instruments alike; Q is its inventory bound. A snapshot
+    with different strikes or rights raises ValueError (the instrument index would silently alias)."""
+
+    SIGMA_REFIT_TOL = 0.01
 
     kind: str
     gamma: float
@@ -274,10 +346,16 @@ class PriceSpace:
             return glft_asymptotic_offsets(q, self.gamma, self.k, sig, self.A)
         bid = np.empty(q.shape[0])
         ask = np.empty(q.shape[0])
+        key = (tuple(np.asarray(snap.K, dtype=float).tolist()), tuple(np.asarray(snap.right).tolist()))
+        if "strip" not in self._exact:
+            self._exact["strip"] = key
+        elif self._exact["strip"] != key:
+            raise ValueError("PriceSpace(kind='glft') is bound to the strip it first quoted (sigma_opt frozen there); build a new object")
         for j in range(q.shape[0]):
-            if j not in self._exact:
-                self._exact[j] = GLFT2013(self.gamma, self.k, float(sig[j]), self.A, self.T, self.Q)
-            bid[j], ask[j] = self._exact[j].offsets(int(round(q[j])), t)
+            fitted = self._exact.get(j)
+            if fitted is None or abs(float(sig[j]) - fitted.sigma) > self.SIGMA_REFIT_TOL * fitted.sigma:
+                fitted = self._exact[j] = GLFT2013(self.gamma, self.k, float(sig[j]), self.A, self.T, self.Q)
+            bid[j], ask[j] = fitted.offsets(int(round(q[j])), t)
         return bid, ask
 
     def quotes(self, snap: FairSnapshot, inventory, t: float):

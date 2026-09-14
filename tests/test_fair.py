@@ -167,6 +167,25 @@ def test_past_only_fair_raises_on_any_read_ahead_of_its_clock():
         view.advance(100)
 
 
+def test_snapshots_are_read_only_copies_that_share_no_memory_with_the_path():
+    """A quoter holding a snapshot can neither reach the future through numpy's `.base` nor corrupt the fair
+    the run marks against with an in-place write: every array is a copy with writeable = False, and the path's
+    own arrays are read-only too."""
+    f = _fair()
+    gen = np.random.default_rng(3)
+    path = f.path(gen.standard_normal(20), gen.standard_normal(20), gen.random(20), 1.0 / fair.YEAR_SECONDS)
+    snap = PastOnlyFair(path).current()
+    for name in ("K", "T_rem", "right", "prices", "vols", "deltas", "gammas", "vegas", "thetas"):
+        a = getattr(snap, name)
+        assert a.base is None and not a.flags.writeable, name
+        assert not np.shares_memory(a, getattr(path, name)), name
+    with pytest.raises(ValueError):
+        snap.prices[0] = 0.0
+    with pytest.raises(ValueError):
+        path.prices[5, 0] = 0.0
+    assert np.array_equal(snap.prices, path.prices[0])
+
+
 def test_constructor_rejects_bad_parameters():
     with pytest.raises(ValueError):
         SyntheticFair(S0=-1.0, sigma0=0.2)

@@ -21,8 +21,10 @@ Units and conventions (this module works in YEARS):
   spot_vol per sqrt(year); kappa_vol per year; jump = (lam per year, mu_J, sd_J) in log-return units.
 - past-measurability: `step` reads only its arguments and the current state; `FairPath` stores a whole
   pre-computed path (the informed counterparty and the markouts may read it), and `PastOnlyFair` wraps a
-  path behind a clock and raises `FutureAccessError` on any read ahead of it, so a quoter fed through
-  it cannot see the future in any run, not only in tests.
+  path behind a clock and raises `FutureAccessError` on any read ahead of it; every snapshot is a read-only
+  COPY of one row (no view of the path's arrays reaches the quoter, so `.base` cannot expose the future and
+  an in-place write cannot corrupt the fair), so a quoter fed through it cannot see the future in any run,
+  not only in tests.
 
 Invariants kept (tested): every Greek matches a central finite difference of `black_price`; `path` equals
 the sequence of `step` snapshots; call - put == S - K (parity at r = q = 0) to 1e-10.
@@ -319,11 +321,17 @@ class SyntheticFair:
 # ----------------------------------------------------------------------------------------------------------
 
 
+def _frozen(a: np.ndarray) -> np.ndarray:
+    out = np.array(a, copy=True)
+    out.flags.writeable = False
+    return out
+
+
 @dataclass(frozen=True)
 class FairPath:
     """n_steps + 1 states of the strip; row i is the state after i steps. 2-D arrays are (n_steps + 1,
-    n_instruments). The counterparty and the markouts may read any row; the quoter must go through
-    `PastOnlyFair`."""
+    n_instruments), all read-only. The counterparty and the markouts may read any row; the quoter must go
+    through `PastOnlyFair`, whose snapshots are copies (see `snapshot`)."""
 
     instruments: pd.DataFrame
     dt: float
@@ -348,11 +356,18 @@ class FairPath:
     def n_instruments(self) -> int:
         return int(self.K.shape[0])
 
+    def __post_init__(self):
+        for name in ("t", "spot", "sigma_atm", "K", "right", "T_rem", "prices", "vols", "deltas", "gammas", "vegas", "thetas"):
+            getattr(self, name).flags.writeable = False
+
     def snapshot(self, i: int) -> FairSnapshot:
+        """Row i as read-only COPIES: the snapshot shares no memory with the path (no numpy view whose
+        `.base` is the whole pre-drawn future) and an in-place write on it raises rather than corrupting
+        the fair every later step is marked against."""
         return FairSnapshot(
-            t=float(self.t[i]), spot=float(self.spot[i]), sigma_atm=float(self.sigma_atm[i]), K=self.K,
-            T_rem=self.T_rem[i], right=self.right, prices=self.prices[i], vols=self.vols[i],
-            deltas=self.deltas[i], gammas=self.gammas[i], vegas=self.vegas[i], thetas=self.thetas[i],
+            t=float(self.t[i]), spot=float(self.spot[i]), sigma_atm=float(self.sigma_atm[i]), K=_frozen(self.K),
+            T_rem=_frozen(self.T_rem[i]), right=_frozen(self.right), prices=_frozen(self.prices[i]), vols=_frozen(self.vols[i]),
+            deltas=_frozen(self.deltas[i]), gammas=_frozen(self.gammas[i]), vegas=_frozen(self.vegas[i]), thetas=_frozen(self.thetas[i]),
         )
 
 

@@ -76,8 +76,19 @@ def test_positions_and_cash_follow_the_fills_and_hedges():
 
 
 def test_time_hedger_trades_on_its_grid_and_no_hedger_never():
+    """The grid is anchored at t = 0 whether or not the mismatch was zero there: with thin flow (no fill at
+    t = 0 for seeds 0, 1, 5) the hedges still land on {60, 120, ...}, never on first-fill + 60 k."""
     r = run(SimConfig(seconds=300.0, seed=2), _quoter(), TimeHedger(60.0), _fair(), FLOW)
-    assert list(r.hedges["t"]) == [0.0, 60.0, 120.0, 180.0, 240.0] or list(r.hedges["t"]) == [60.0, 120.0, 180.0, 240.0]
+    assert set(r.hedges["t"]) <= {0.0, 60.0, 120.0, 180.0, 240.0} and r.n_hedges >= 4
+    thin = FlowParams(A=0.02, k=20.0)
+    for seed in (0, 1, 5):
+        rt = run(SimConfig(seconds=600.0, seed=seed), _quoter(T=600.0), TimeHedger(60.0), _fair(), thin)
+        first_fill = float(rt.fills["t"].min())
+        assert first_fill > 0.0 and rt.n_hedges >= 2
+        assert set(rt.hedges["t"]) <= set(np.arange(0.0, 600.0, 60.0)), (seed, list(rt.hedges["t"]))
+        # every grid point after the first fill with a nonzero mismatch traded
+        due = [t for t in np.arange(0.0, 600.0, 60.0) if t >= first_fill]
+        assert due[0] in set(rt.hedges["t"]) or rt.hedge_pos[int(due[0])] == -float(np.sum(rt.positions[int(due[0]) + 1] * rt.path.deltas[int(due[0])]))
     r2 = run(SimConfig(seconds=300.0, seed=2), _quoter(), NoHedger(), _fair(), FLOW)
     assert r2.n_hedges == 0 and r2.attribution.hedge == 0.0 and r2.attribution.hedge_cost == 0.0
     assert np.all(r2.hedge_pos == 0.0)
@@ -87,6 +98,7 @@ def test_summary_and_run_properties():
     r = run(SimConfig(seconds=120.0, seed=3), _quoter(), BandHedger(5.0), _fair(), FLOW)
     s = r.summary()
     assert s["n_fills"] == r.n_fills == int(r.fills["qty"].sum())
+    assert s["n_inside_fair"] == r.n_inside_fair == 0  # gamma 10: no per-side offset below zero on this run
     assert s["abs_q_T"] == float(np.abs(r.terminal_inventory).sum())
     assert s["realised"] == r.attribution.realised and s["gap"] == r.attribution.gap
     assert s["n_candidates"] == r.n_candidates > r.n_fills

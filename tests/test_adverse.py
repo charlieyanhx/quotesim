@@ -6,7 +6,7 @@ p = 1 informed -> negative; cluster SE by time bucket because markouts overlap).
 import numpy as np
 import pytest
 
-from quotesim import adverse
+from quotesim import adverse, pnl
 from quotesim.adverse import clustered_se, markouts, toxicity
 from quotesim.fair import SyntheticFair
 from quotesim.flow import FlowParams
@@ -130,6 +130,14 @@ def test_bad_inputs_raise():
     r = _run(seconds=60.0)
     with pytest.raises(ValueError):
         markouts(r, horizons=(0.0,))
+    for h in (0.25, 0.5, 1.4, 2.5):  # not a whole number of 1 s steps: refused, not rounded to a mislabelled row
+        with pytest.raises(ValueError):
+            markouts(r, horizons=(h,))
+        with pytest.raises(ValueError):
+            pnl.attribute(r, h=h)
+    assert adverse.horizon_steps(60.0, 0.5) == 120 and adverse.horizon_steps(3.0, 1.0) == 3
+    with pytest.raises(ValueError):
+        adverse.horizon_steps(0.5, 1.0)
 
     class Pulled:
         def quotes(self, snap, inventory, t):

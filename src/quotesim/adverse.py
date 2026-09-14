@@ -31,6 +31,15 @@ MARKOUT_COLUMNS = ("horizon_s", "class", "n", "realised_spread_mean", "adverse_m
                    "n_vp", "realised_spread_vp", "adverse_vp", "markout_vp", "se_clustered_vp")
 
 
+def horizon_steps(h: float, dt: float) -> int:
+    """h / dt as an integer; a horizon that is not a positive whole number of steps raises (a shorter or
+    fractional h would be silently rounded to whole steps while the row and the cluster width still said h)."""
+    steps = h / dt
+    if h <= 0 or abs(steps - round(steps)) > 1e-9 * max(1.0, steps) or round(steps) < 1:
+        raise ValueError(f"horizon h = {h} s must be a positive whole number of steps of dt = {dt} s")
+    return int(round(steps))
+
+
 def _per_fill(run, h: float):
     """Per-fill arrays at horizon h: weight (qty), realised spread, adverse, markout ($), vega at fill, bucket."""
     f = run.fills
@@ -44,7 +53,7 @@ def _per_fill(run, h: float):
     mult = run.multiplier[inst]
     F = run.path.prices
     n = run.path.n_steps
-    h_steps = max(1, int(round(h / run.config.dt)))
+    h_steps = horizon_steps(h, run.config.dt)
     ahead = np.minimum(step + h_steps, n)
     realised = sign * (F[step, inst] - px) * mult
     adverse = sign * (F[ahead, inst] - F[step, inst]) * mult

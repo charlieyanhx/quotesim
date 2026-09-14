@@ -7,7 +7,11 @@ the Greek terms; MM-side sign: + = the market maker BUYS):
   at spot S_t. Every option quantity is multiplied by the instrument's `multiplier` (1.0 in v0.1).
 - with q_t the option positions HELD OVER step t (after that step's fills), h_t the hedge shares held over
   step t, fills f = (step t_f, instrument j, signed lots dq_f, price px_f) and hedge trades with cost c:
-    SPREAD = sum_f dq_f (F_{t_f} - px_f)            realised half-spread on every fill (>= 0 for a passive fill)
+    SPREAD = sum_f dq_f (F_{t_f} - px_f)            realised half-spread on every fill (>= 0 while the quote sits
+                                                     outside fair; an A-S / GLFT per-side offset goes negative at
+                                                     |q| > c / w, the quote then sits INSIDE fair, is hit with
+                                                     probability 1 and the fill's SPREAD term is negative: the
+                                                     maker pays to unwind. `Run.n_inside_fair` counts those lots)
     INV    = sum_t q_t . (F_{t+1} - F_t)             option positions marked step by step
     HEDGE  = sum_t h_t (S_{t+1} - S_t)               hedge shares marked step by step
     HCOST  = sum_hedge trades c                      half-spread + impact of every hedge trade (>= 0)
@@ -15,7 +19,13 @@ the Greek terms; MM-side sign: + = the market maker BUYS):
   and R = SPREAD + INV + HEDGE - HCOST with NO residual: every cash flow or mark change in the loop is one
   of the four (an option fill moves cash by -dq px and the mark by +dq F; a hedge trade moves cash by
   -dh S - c and the mark by +dh S; holding moves the marks by q dF and h dS). `gap` = R - (the sum), every
-  sum a `math.fsum`; `sim.run` raises if |gap| >= 1e-9.
+  sum a `math.fsum`, so the gap is the rounding of the PRODUCTS the sums are over (qty px mult, q F mult,
+  q dF mult, h dS ...), each within 2 ulp of its value: |gap| <= 2 eps * `scale`, where `scale` is the gross
+  $ of every such product (all fills, hedge trades and costs, opening and terminal marks, the gross inventory
+  and hedge marks). `sim.run` raises if |gap| >= `bar` = max(GAP_BAR = 1e-9, GAP_REL = 1e-12 * scale): the
+  relative part is 4,500x the rounding bound (a bookkeeping error is >= one product, 1e12 x larger), the
+  absolute floor is where $-scale runs sit (scale ~1e5 $ on the README's strip gives a bar of ~1e-7;
+  multiplier 100 on a 500 $ underlying with a 100-lot opening book gives gaps ~1e-9 on a scale ~1e9).
 - sub-splits of INV, both exact (the fill decomposition q_t = q_0 + sum_{f: t_f <= t} dq_f):
     INV = OPENING + ADVERSE_h + DRIFT_h,  OPENING = q_0 . (F_T - F_0),
          ADVERSE_h = sum_f dq_f (F_{t_f + h} - F_{t_f}),  DRIFT_h = sum_f dq_f (F_T - F_{t_f + h}),
@@ -29,8 +39,9 @@ the Greek terms; MM-side sign: + = the market maker BUYS):
   strike: it carries the smile move from dk = -dS/S); RESID = INV - INV_greek (vanna, volga, third order,
   jumps). `greek_theta` equals `theta` by construction.
 
-Invariants kept (tested): |gap| < 1e-9 on every run; sub-split gaps < 1e-9; a zero-inventory run has
-INV = 0 exactly; RESID is small relative to the gross inventory move at 1-second steps.
+Invariants kept (tested): |gap| < bar on every run and |gap| < 1e-11 on the README's $-scale runs;
+sub-split gaps < bar; a zero-inventory run has INV = 0 exactly; RESID is small relative to the gross
+inventory move at 1-second steps.
 """
 
 from __future__ import annotations
@@ -40,13 +51,15 @@ from math import fsum
 
 import numpy as np
 
+from quotesim.adverse import horizon_steps
 from quotesim.fair import YEAR_SECONDS
 
-GAP_BAR = 1e-9
+GAP_BAR = 1e-9  # absolute floor of the identity bar ($)
+GAP_REL = 1e-12  # relative part: bar = max(GAP_BAR, GAP_REL * scale), scale = gross $ of the summed products
 
 TERMS = (
     "realised", "spread", "inventory", "hedge", "hedge_cost", "opening", "adverse_h", "drift_h", "theta",
-    "inventory_ex_theta", "greek_delta", "greek_gamma", "greek_vega", "greek_theta", "resid", "gap",
+    "inventory_ex_theta", "greek_delta", "greek_gamma", "greek_vega", "greek_theta", "resid", "gap", "scale",
 )
 
 
@@ -71,6 +84,12 @@ class Attribution:
     greek_theta: float
     resid: float
     h: float
+    scale: float = 0.0
+
+    @property
+    def bar(self) -> float:
+        """The identity bar of this run: max(GAP_BAR, GAP_REL * scale)."""
+        return max(GAP_BAR, GAP_REL * self.scale)
 
     @property
     def split_gap_fills(self) -> float:
@@ -121,8 +140,6 @@ def attribute(run, h: float = 60.0) -> Attribution:
     """Attribution of a `sim.Run` at markout horizon h seconds (clipped at the end of the run).
     Every sum is a `math.fsum` over the elementwise products, so the terms are exact to ~1e-12 on $-scale
     runs and the identity gap is a rounding residual, not a model one."""
-    if h <= 0:
-        raise ValueError("h must be > 0 seconds")
     path = run.path
     F, S = path.prices, path.spot
     mult = run.multiplier
@@ -145,7 +162,7 @@ def attribute(run, h: float = 60.0) -> Attribution:
     realised = fsum([run.cash_T, marks_T, -marks_0])
     gap = realised - fsum([spread, inventory, hedge, -hedge_cost])
 
-    h_steps = max(1, int(round(h / run.config.dt)))
+    h_steps = horizon_steps(h, run.config.dt)
     ahead = np.minimum(step + h_steps, n)
     opening = fsum(pos[0] * (F[n] - F[0]) * mult)
     adverse = fsum(dq * (F[ahead, inst] - F[step, inst]) * mult[inst])
@@ -160,19 +177,30 @@ def attribute(run, h: float = 60.0) -> Attribution:
     g_vega = fsum((held * path.vegas[:-1] * np.diff(path.vols, axis=0) * mult[None, :]).ravel())
     resid = inventory - fsum([g_delta, g_gamma, g_vega, theta])
 
+    hedge_sh = run.hedges["shares"].to_numpy(dtype=float)
+    hedge_S = run.hedges["S"].to_numpy(dtype=float)
+    scale = fsum(np.concatenate([
+        np.abs(dq * px * mult[inst]), np.abs(dq * (fair - px) * mult[inst]), np.abs(hedge_sh * hedge_S),
+        run.hedges["cost"].to_numpy(dtype=float), np.abs(held * dF * mult[None, :]).ravel(), np.abs(h_held * dS),
+        np.abs(pos[n] * F[n] * mult), np.abs(pos[0] * F[0] * mult), [abs(hpos[n] * S[n]), abs(hpos[0] * S[0])],
+    ]))
+
     return Attribution(
         spread=spread, inventory=inventory, hedge=hedge, hedge_cost=hedge_cost, realised=realised, gap=gap,
         opening=opening, adverse_h=adverse, drift_h=drift, theta=theta, inventory_ex_theta=inv_ex_theta,
         greek_delta=g_delta, greek_gamma=g_gamma, greek_vega=g_vega, greek_theta=theta, resid=resid, h=float(h),
+        scale=scale,
     )
 
 
-def check_identity(att: Attribution, bar: float = GAP_BAR) -> None:
-    """Raise AssertionError with the numbers if the top identity or a sub-split is off by >= bar."""
+def check_identity(att: Attribution, bar: float | None = None) -> None:
+    """Raise AssertionError with the numbers if the top identity or a sub-split is off by >= bar
+    (default: the run's own `att.bar` = max(GAP_BAR, GAP_REL * scale))."""
+    bar = att.bar if bar is None else bar
     if not abs(att.gap) < bar:
         raise AssertionError(
             f"attribution identity broken: realised {att.realised:.12f} != spread {att.spread:.12f} + inventory "
-            f"{att.inventory:.12f} + hedge {att.hedge:.12f} - hedge_cost {att.hedge_cost:.12f} (gap {att.gap:.3e})"
+            f"{att.inventory:.12f} + hedge {att.hedge:.12f} - hedge_cost {att.hedge_cost:.12f} (gap {att.gap:.3e}, bar {bar:.3e})"
         )
     if not abs(att.split_gap_fills) < bar:
         raise AssertionError(f"fill split broken: inventory {att.inventory:.12f} vs opening {att.opening:.12f} + adverse "
