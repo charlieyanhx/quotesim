@@ -202,5 +202,7 @@ Everything in this repository is synthetic: the fair surface, the spot and vol p
 - [riskkit](https://github.com/charlieyanhx/riskkit) — SPAN-style margin and scenario ladders
 - [volsurf](https://github.com/charlieyanhx/volsurf) — SVI / SSVI surfaces; the v0.2 `FairSurface` adapter
 - [quant-research-agent](https://github.com/charlieyanhx/quant-research-agent) — research task runner
+- [tickq](https://github.com/charlieyanhx/tickq) — DuckDB market-data SQL; the lake the fills and quotes would live in
+- [lobcore](https://github.com/charlieyanhx/lobcore) — bounded-array limit order book in Rust with ITCH 5.0 replay and PyO3 bindings
 
 MIT © Hanxiong (Charlie) Yan
