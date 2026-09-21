@@ -207,3 +207,28 @@ def test_readme_has_the_markers_and_none_of_the_banned_tokens():
     assert hits == [], hits
     assert "synthetic" in text and "no queue" in text and "MIT © Hanxiong (Charlie) Yan" in text
     assert f"{ReportSizes().identity_seeds} seeds" in text
+
+
+def test_check_tolerates_one_decade_in_a_gap_ceiling_and_nothing_else():
+    """`quotesim report --check`: a gap ceiling may sit one decade off (CI printed `< 1e-12` and `< 1e-11`
+    on two runs of one commit); any other token, or a two-decade move, is a mismatch."""
+    committed = "| a | 50/50 | < 1e-12 | < 1e-13 | 2635.8 |"
+    assert report.blocks_match(committed, committed) == []
+    assert report.blocks_match(committed, "| a | 50/50 | < 1e-11 | < 1e-14 | 2635.8 |") == []
+    assert report.blocks_match(committed, "| a | 50/50 | < 1e-10 | < 1e-13 | 2635.8 |") == ["'1e-12' vs '1e-10'"]
+    assert report.blocks_match(committed, "| a | 49/50 | < 1e-12 | < 1e-13 | 2635.8 |") == ["'50/50' vs '49/50'"]
+    assert report.blocks_match(committed, "| a | 50/50 | < 1e-12 | < 1e-13 | 2635.9 |") == ["'2635.8' vs '2635.9'"]
+    assert report.blocks_match(committed, "| a | 50/50 | < 1e-12 | < 1e-13 |")[0].startswith("token count")
+
+
+def test_check_readme_reproduces_the_skeleton(tmp_path, built):
+    """A README skeleton regenerated at the tests' sizes passes `check_readme` at the same sizes and fails
+    it once one non-ceiling token is edited."""
+    skel = tmp_path / "README.md"
+    skel.write_text("".join(f"{report.BEGIN.format(name=n)}\n{report.END.format(name=n)}\n" for n in SECTIONS))
+    update_readme(skel, SMALL)
+    assert report.check_readme(skel, SMALL) == {}
+    text = skel.read_text()
+    tok = report.read_sections(text)["identity"].split()[-2]
+    skel.write_text(text.replace(tok, "0.0", 1))
+    assert "identity" in report.check_readme(skel, SMALL)

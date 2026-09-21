@@ -32,6 +32,17 @@ def _run_cmd(a: argparse.Namespace) -> int:
 def _report_cmd(a: argparse.Namespace) -> int:
     sizes = report.ReportSizes.small() if a.small else report.ReportSizes()
     t0 = time.perf_counter()
+    if a.check:
+        bad = report.check_readme(a.readme, sizes)
+        for name, items in bad.items():
+            print(f"{a.readme} section '{name}' differs from a fresh `quotesim report`:", file=sys.stderr)
+            for it in items:
+                print(f"  {it}", file=sys.stderr)
+        print(f"quotesim report --check: {time.perf_counter() - t0:.1f} s wall", file=sys.stderr)
+        if bad:
+            return 1
+        print(f"{a.readme}: every section reproduces (gap ceilings within one decade)", file=sys.stderr)
+        return 0
     if a.stdout:
         blocks = report.render(report.build(sizes))
         for name, body in blocks.items():
@@ -63,6 +74,8 @@ def main(argv=None) -> int:
     rp.add_argument("--readme", default="README.md")
     rp.add_argument("--stdout", action="store_true", help="print the blocks instead of editing the README")
     rp.add_argument("--small", action="store_true", help="the tests' sizes (seconds, not minutes)")
+    rp.add_argument("--check", action="store_true",
+                    help="regenerate and compare instead of writing: exit 1 unless every token matches, gap ceilings within one decade")
     rp.set_defaults(fn=_report_cmd)
     a = p.parse_args(argv)
     return a.fn(a)

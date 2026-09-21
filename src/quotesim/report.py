@@ -2,7 +2,9 @@
 
 Everything here is synthetic and seeded; the tables regenerate byte-identically on one machine and are
 printed at a precision (3-5 significant figures, gaps as a power-of-ten ceiling) chosen so that last-ulp
-differences between platforms do not change the text. No number in the README comes from anywhere else.
+differences between platforms do not change the text, with one exception: a gap ceiling can print one decade
+apart on two CPUs when the gap sits at a decade boundary, so `quotesim report --check` (what CI runs) accepts
+a one-decade difference in a ceiling and nothing else. No number in the README comes from anywhere else.
 
 Sections (marker name -> what):
 - identity : the attribution identity over N seeds, half price-space and half vol-space, jumps on:
@@ -97,11 +99,33 @@ def vol_quoter(gamma: float, price_q: PriceSpace, fair: SyntheticFair) -> VolSpa
 
 
 def pow10_ceiling(x: float) -> str:
-    """'< 1e-12' for 3.6e-13: the power-of-ten ceiling, stable across platforms; '0' for an exact zero."""
+    """'< 1e-12' for 3.6e-13: the power-of-ten ceiling; '0' for an exact zero. A last-ulp gap that sits at a decade
+    boundary prints one decade apart on two CPUs (9.9e-13 on one summation kernel, 1.01e-12 on another: CI saw
+    exactly this between two runs of the same commit), which is why `check_readme` tolerates one decade here."""
     x = abs(float(x))
     if x == 0.0:
         return "0"
     return f"< 1e{math.floor(math.log10(x)) + 1:d}"
+
+
+CEILING = re.compile(r"^<?\s*1e(-?\d+)$")
+
+
+def blocks_match(committed: str, fresh: str, decades: int = 1) -> list[str]:
+    """Token-by-token comparison of two rendered blocks: every token must be identical, except that a
+    power-of-ten ceiling (`1e-12` after a `<`) may differ by at most `decades`. Returns the mismatches."""
+    a, b = committed.split(), fresh.split()
+    bad = []
+    if len(a) != len(b):
+        bad.append(f"token count {len(a)} vs {len(b)}")
+    for x, y in zip(a, b, strict=False):
+        if x == y:
+            continue
+        mx, my = CEILING.match(x), CEILING.match(y)
+        if mx and my and abs(int(mx.group(1)) - int(my.group(1))) <= decades:
+            continue
+        bad.append(f"{x!r} vs {y!r}")
+    return bad
 
 
 def md_table(df: pd.DataFrame, fmt: dict | None = None, default: str = "{:.3f}", index: bool = False) -> str:
@@ -439,6 +463,27 @@ def replace_sections(text: str, blocks: dict[str, str]) -> str:
             raise ValueError(f"README has no markers for section '{name}'")
         text = pattern.sub(lambda _m, rep=f"{b}\n{body}\n{e}": rep, text)
     return text
+
+
+def read_sections(text: str) -> dict[str, str]:
+    """The body between each pair of markers, by section name."""
+    out = {}
+    for name in SECTIONS:
+        b, e = BEGIN.format(name=name), END.format(name=name)
+        m = re.search(re.escape(b) + r"\n(.*?)\n" + re.escape(e), text, re.DOTALL)
+        if not m:
+            raise ValueError(f"README has no markers for section '{name}'")
+        out[name] = m.group(1)
+    return out
+
+
+def check_readme(path, sizes: ReportSizes | None = None, decades: int = 1) -> dict[str, list[str]]:
+    """Regenerate the blocks and compare them with the README's: {section: mismatches}, empty when they agree.
+    Everything must match token for token except a gap ceiling, which may differ by `decades`."""
+    with open(path, encoding="utf-8") as f:
+        have = read_sections(f.read())
+    fresh = render(build(sizes or ReportSizes()))
+    return {name: bad for name in SECTIONS if (bad := blocks_match(have[name], fresh[name], decades))}
 
 
 def update_readme(path, sizes: ReportSizes | None = None) -> dict:

@@ -2,6 +2,8 @@
 
 ## 0.1.0 (2026-09-14)
 
+- `quotesim report --check`: regenerate and compare instead of writing; every token must match except a gap ceiling, which may differ by one decade (CI printed `< 1e-12` and `< 1e-11` for the same commit on two runners: the gap is a last-ulp quantity and the fleet does not share a summation kernel). CI runs the check instead of `git diff` on the README.
+
 First release. Synthetic-flow options quoting simulator.
 
 - `fair.py`: `SyntheticFair` (Black on a quadratic smile, GBM spot with optional Merton jumps, OU ATM vol), analytic Greeks checked against finite differences, `FairPath` (read-only arrays), `PastOnlyFair` raising `FutureAccessError` on any future access and handing out read-only copies (no view of the path reaches a quoter).

@@ -204,7 +204,11 @@ paths per gamma, the paired sweep at 16 seeds x 600 s per cell (18 cells), one 3
 band frontier at 8 seeds x 600 s per band; about 90 s of wall time on the machine named in the README.
 Numbers are printed at 2-4 significant figures and gaps as power-of-ten ceilings so that last-ulp
 differences do not change the text; `tests/test_report_cli.py` regenerates a README skeleton twice at
-`ReportSizes.small()` and asserts the bytes are identical. The A-S table stands beside the paper's numbers;
+`ReportSizes.small()` and asserts the bytes are identical. Across machines the ceiling itself is the one
+thing that can move: a gap at a decade boundary printed `< 1e-12` and `< 1e-11` on two CI runs of the same
+commit (GitHub's runners do not share a CPU, and numpy's pairwise summation blocks differently per SIMD
+width), so CI runs `quotesim report --check`, which requires every token to match and lets a ceiling
+differ by one decade; a two-decade move, or any other token, fails the check. The A-S table stands beside the paper's numbers;
 the paper's RNG is not published, so only directions and rough magnitudes (within 15 %, tested) are
 reproducible.
 

@@ -17,7 +17,7 @@ jobs:
       - run: python -m pip install -e ".[dev]"
       - run: ruff check src tests
       - run: pytest -q
-      # every README number is produced by `quotesim report` from fixed seeds and must regenerate byte-identically
-      - run: |
-          quotesim report
-          git diff --exit-code -- README.md
+      # every README number is produced by `quotesim report` from fixed seeds and must reproduce token for token;
+      # a gap ceiling (a last-ulp quantity) may sit one decade off, because the runner fleet's summation kernels
+      # differ (9.9e-13 vs 1.01e-12 on two runs of one commit); nothing else may differ
+      - run: quotesim report --check

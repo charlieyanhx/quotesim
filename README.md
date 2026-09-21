@@ -11,7 +11,7 @@ An options quoting simulator with synthetic flow. It holds Avellaneda-Stoikov (2
 ```bash
 python -m pip install -e ".[dev]"
 pytest -q            # 114 tests, ~25 s on the machine below
-quotesim report      # regenerates every table below from fixed seeds (~90 s)
+quotesim report      # regenerates every table below from fixed seeds (~90 s); --check compares instead (what CI runs)
 quotesim run --seed 1   # one run: the attribution waterfall and the toxicity table
 quotesim run --seed 1 --space vol --informed 0.3 --band 25
 ```
@@ -153,7 +153,7 @@ Tested:
 - The quoter only ever sees the fair at the clock (`PastOnlyFair` raises on any index ahead, and every snapshot is a read-only copy: no numpy view of the pre-drawn path reaches the quoter, an in-place write on a snapshot raises instead of corrupting the fair); the fill acceptance rate is `exp(-k delta)` within a binomial CI; the informed adverse mean is `-(2p - 1) sigma_F sqrt(h) sqrt(2 / pi)` within block SE.
 - The published closed forms: A-S 2008 spread 1.690770 / 1.290770 and reservation shift 0.4 per lot; GLFT exact `delta_b(0) = 3.313045` vs asymptotic 3.312915 and `|exact - asymptotic| <= 5e-3` for `|q| <= 20`, plus the exact quotes at Q = 100 against a 70-digit reference (`delta_b(65) = 7.459403`, `delta_b(99) = 9.320168`) and against the long-horizon ground state on every q; Stoikov-Sağlam eq. 17 and Theorem 4 (`k = 0.03855879`, vega share 99.87 %); Whalley-Wilmott `H = 0.06198337` and `8x lam -> 2x H` exactly.
 - Every Greek of `SyntheticFair` against central finite differences; the Merton compensator makes `E[S_{t+dt}] = S_t` for any `dt`.
-- `quotesim report` regenerates this README byte-identically on one machine (tests/test_report_cli.py runs it twice at the tests' sizes); the README contains none of the five banned words listed in tests/test_report_cli.py (no language about what a desk would earn).
+- `quotesim report` regenerates this README byte-identically on one machine (tests/test_report_cli.py runs it twice at the tests' sizes), and `quotesim report --check` (CI) reproduces every token on another, a gap ceiling within one decade (the gap is a last-ulp quantity and CI's runners do not share a summation kernel: one commit printed `< 1e-12` and `< 1e-11` on two runs); the README contains none of the five banned words listed in tests/test_report_cli.py (no language about what a desk would earn).
 
 By construction (not a test):
 
