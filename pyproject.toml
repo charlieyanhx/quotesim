@@ -1,6 +1,6 @@
 [project]
 name = "quotesim"
-version = "0.1.0"
+version = "0.1.1"
 description = "An options quoting simulator with synthetic flow: Avellaneda-Stoikov and Guéant-Lehalle-Fernandez-Tapia quoters in price space and in vol space, delta-band hedging with a cost model, and a P&L attribution whose top identity (spread + inventory + hedge - hedge cost = realised) holds to 1e-9 by construction; paired-seed comparisons only."
 readme = "README.md"
 requires-python = ">=3.11"

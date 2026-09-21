@@ -1,8 +1,10 @@
 # Changelog
 
-## 0.1.0 (2026-09-14)
+## 0.1.1 (2026-09-21)
 
 - `quotesim report --check`: regenerate and compare instead of writing; every token must match except a gap ceiling, which may differ by one decade (CI printed `< 1e-12` and `< 1e-11` for the same commit on two runners: the gap is a last-ulp quantity and the fleet does not share a summation kernel). CI runs the check instead of `git diff` on the README.
+
+## 0.1.0 (2026-09-14)
 
 First release. Synthetic-flow options quoting simulator.
 
