@@ -204,5 +204,7 @@ Everything in this repository is synthetic: the fair surface, the spot and vol p
 - [quant-research-agent](https://github.com/charlieyanhx/quant-research-agent) — research task runner
 - [tickq](https://github.com/charlieyanhx/tickq) — DuckDB market-data SQL; the lake the fills and quotes would live in
 - [lobcore](https://github.com/charlieyanhx/lobcore) — bounded-array limit order book in Rust with ITCH 5.0 replay and PyO3 bindings
+- [exhibitkit](https://github.com/charlieyanhx/exhibitkit) — sell-side research documents from Markdown
+- [claimkeeper](https://github.com/charlieyanhx/claimkeeper) — a ledger that scores a note's falsifiable claims once their dates arrive
 
 MIT © Hanxiong (Charlie) Yan
